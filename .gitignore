@@ -1,0 +1,19 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Mac OS folder attributes
+.DS_Store
+
+# Virtual environments
+venv/
+env/
+ENV/
+.env
+
+# Datasets
+RepositoryData/
+
+# Ignore Jupyter Notebook checkpoints
+.ipynb_checkpoints/
