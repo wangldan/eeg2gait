@@ -11,7 +11,7 @@ Paper architecture (Section III, Figure 2):
              + residual: cat(HGP_out, LTL_out) before GSL
   4. GSL  — Global Spatial Learner (depth-wise conv + BN + ELU + Dropout + AvgPool)
   5. FFN  — Feature Fusion Network (3 conv blocks [50,100,200] + pooling)
-  6. GTL  — Global Temporal Learner (multi-head self-attention)
+  6. GTL  — Global Temporal Learner (Autoformer: AutoCorrelation + SeriesDecomp)
   7. OUT  — Task-specific output layer: cat(GTL_in, GTL_out) → weight-constrained conv
 """
 
@@ -227,21 +227,33 @@ class FeatureFusionNetwork(nn.Module):
     """
 
     def __init__(self, in_f, filter_list=None, kernel=KERNEL_WIDTH,
-                 pool=POOL_WIDTH, dropout=DROPOUT_P):
+                 pool=POOL_WIDTH, dropout=DROPOUT_P, n_pool_blocks=None):
+        """
+        n_pool_blocks: how many of the leading blocks include a MaxPool.
+        Default (None) preserves original behaviour (every block pools).
+        Reducing it leaves the later blocks at full temporal resolution so
+        downstream temporal modules (e.g. AutoformerGTL) receive a sequence
+        long enough for FFT autocorrelation to be meaningful.
+        """
         super().__init__()
         if filter_list is None:
             filter_list = FFN_FILTERS
+        if n_pool_blocks is None:
+            n_pool_blocks = len(filter_list)
+        self.n_pool_blocks = n_pool_blocks
         blocks = []
         prev = in_f
-        for f in filter_list:
-            blocks.append(nn.Sequential(
+        for idx, f in enumerate(filter_list):
+            layers = [
                 nn.Dropout(p=dropout),
                 nn.ZeroPad2d(((kernel - 1) // 2, kernel // 2, 0, 0)),
                 Conv2dWithConstraint(prev, f, (1, kernel), bias=False, max_norm=2),
                 nn.BatchNorm2d(f),
                 nn.ELU(),
-                nn.MaxPool2d((1, pool), stride=(1, pool)),
-            ))
+            ]
+            if idx < n_pool_blocks:
+                layers.append(nn.MaxPool2d((1, pool), stride=(1, pool)))
+            blocks.append(nn.Sequential(*layers))
             prev = f
         self.blocks = nn.Sequential(*blocks)
 
@@ -250,31 +262,121 @@ class FeatureFusionNetwork(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 6. GTL — Global Temporal Learner
+# 6. GTL — Global Temporal Learner (Autoformer encoder block)
 # ──────────────────────────────────────────────────────────────────────────────
 
-class GlobalTemporalLearner(nn.Module):
+class SeriesDecomp(nn.Module):
     """
-    Multi-head self-attention over the temporal dimension with residual connection.
-    Paper Sec. III-G.
+    Moving-average trend/seasonal decomposition (Autoformer, Wu et al. 2021, §3.1).
+    Returns (seasonal, trend) where trend = AvgPool1d(x) and seasonal = x − trend.
+    Padding preserves the temporal length T.
+    """
+
+    def __init__(self, kernel_size=25):
+        super().__init__()
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        padding = (kernel_size - 1) // 2
+        self.avg = nn.AvgPool1d(kernel_size, stride=1, padding=padding)
+
+    def forward(self, x):                       # x: [B, T, C]
+        x_t = x.permute(0, 2, 1)               # [B, C, T]
+        trend = self.avg(x_t).permute(0, 2, 1) # [B, T, C]
+        seasonal = x - trend
+        return seasonal, trend
+
+
+class AutoCorrelationLayer(nn.Module):
+    """
+    FFT-based O(N log N) time-delay similarity aggregation (Autoformer §3.2),
+    replacing vanilla O(N²) dot-product self-attention. Computes per-head
+    autocorrelation via the Wiener–Khinchin theorem and aggregates V at the
+    top-k most informative delays.
+    """
+
+    def __init__(self, embed_dim, n_heads=4, dropout=0.1):
+        super().__init__()
+        assert embed_dim % n_heads == 0, "embed_dim must be divisible by n_heads"
+        self.n_heads = n_heads
+        self.head_dim = embed_dim // n_heads
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):                              # x: [B, T, C]
+        B, T, C = x.shape
+        H, D = self.n_heads, self.head_dim
+
+        Q = self.q_proj(x).view(B, T, H, D).permute(0, 2, 1, 3)  # [B,H,T,D]
+        K = self.k_proj(x).view(B, T, H, D).permute(0, 2, 1, 3)
+        V = self.v_proj(x).view(B, T, H, D).permute(0, 2, 1, 3)
+
+        # Cross-correlation in frequency domain → O(N log N) time delay similarity
+        Q_f = torch.fft.rfft(Q, dim=2)
+        K_f = torch.fft.rfft(K, dim=2)
+        corr = torch.fft.irfft(Q_f * K_f.conj(), n=T, dim=2)     # [B,H,T,D]
+
+        # Top-k delay selection (k = ceil(log T) per Autoformer)
+        k = max(1, int(math.ceil(math.log(max(T, 2)))))
+        k = min(k, T)
+        score = corr.mean(dim=(0, 3))                            # [H, T]
+        _, top_idx = score.topk(k, dim=-1)                       # [H, k]
+        top_weights = torch.softmax(
+            score.gather(-1, top_idx), dim=-1
+        )                                                         # [H, k]
+
+        # Aggregate V at each selected delay via cyclic roll
+        out = torch.zeros_like(V)                                 # [B,H,T,D]
+        for i in range(k):
+            for h in range(H):
+                lag = int(top_idx[h, i].item())
+                rolled = torch.roll(V[:, h], shifts=-lag, dims=1) # [B,T,D]
+                out[:, h] = out[:, h] + top_weights[h, i] * rolled
+
+        out = out.permute(0, 2, 1, 3).reshape(B, T, C)
+        return self.dropout(self.out_proj(out))
+
+
+class AutoformerGTL(nn.Module):
+    """
+    Autoformer encoder block replacing the vanilla multi-head self-attention GTL.
+    Chains AutoCorrelation → SeriesDecomp → FFN → SeriesDecomp, accumulating
+    trend components and normalising them before the final additive merge.
 
     Input:  [B, F, 1, T]
-    Output: [B, F, 1, T]
+    Output: [B, F, 1, T]  (identical contract to the original GTL)
     """
 
-    def __init__(self, embed_dim, n_heads=GTL_HEADS, dropout=GTL_DROPOUT):
+    def __init__(self, embed_dim, n_heads=GTL_HEADS, dropout=GTL_DROPOUT,
+                 decomp_kernel=25):
         super().__init__()
-        self.attn    = nn.MultiheadAttention(embed_dim, n_heads,
-                                             dropout=dropout, batch_first=True)
-        self.norm    = nn.LayerNorm(embed_dim)
-        self.dropout = nn.Dropout(dropout)
+        self.autocorr   = AutoCorrelationLayer(embed_dim, n_heads, dropout)
+        self.decomp1    = SeriesDecomp(decomp_kernel)
+        self.ffn        = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim * 4, embed_dim),
+        )
+        self.decomp2    = SeriesDecomp(decomp_kernel)
+        self.norm_trend = nn.LayerNorm(embed_dim)
 
     def forward(self, x):
         B, Fdim, _, T = x.shape
-        seq = x.squeeze(2).permute(0, 2, 1)             # [B, T, F]
-        attn_out, _ = self.attn(seq, seq, seq)           # [B, T, F]
-        out = self.norm(seq + self.dropout(attn_out))    # residual + LN
-        return out.permute(0, 2, 1).unsqueeze(2)         # [B, F, 1, T]
+        seq = x.squeeze(2).permute(0, 2, 1)            # [B, T, F]  (Channels-last)
+
+        seq = seq + self.autocorr(seq)
+        seasonal, trend1 = self.decomp1(seq)
+
+        seasonal = seasonal + self.ffn(seasonal)
+        seasonal, trend2 = self.decomp2(seasonal)
+
+        trend = self.norm_trend(trend1 + trend2)
+        out = seasonal + trend                         # [B, T, F]
+
+        return out.permute(0, 2, 1).unsqueeze(2)       # [B, F, 1, T]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -292,10 +394,10 @@ class EEG2Gait(nn.Module):
         LTL  → [B, 25, 59, 100]
         HGP  → [B, 75, 59, 100]   (K*F + F = 3*25 residual cat)
         GSL  → [B, 75,  1,  33]   (AvgPool T//3)
-        FFN  → [B, 200, 1,   1]   (3×MaxPool T//3 each: 33→11→3→1)
-        GTL  → [B, 200, 1,   1]
-        OUT  → cat([GTL_in, GTL_out], dim=3) → [B, 200, 1, 2]
-             → Conv(200, 6, (1,2)) → [B, 6, 1, 1] → [B, 6]
+        FFN  → [B, 200, 1,  11]   (only 1st block pools: 33→11; blocks 2-3 keep T)
+        GTL  → [B, 200, 1,  11]   (Autoformer block — FFT autocorrelation)
+        OUT  → cat([GTL_in, GTL_out], dim=3) → [B, 200, 1, 22]
+             → Conv(200, 6, (1,22)) → [B, 6, 1, 1] → [B, 6]
     """
 
     def __init__(self,
@@ -319,16 +421,21 @@ class EEG2Gait(nn.Module):
         # 4. GSL
         self.gsl = GlobalSpatialLearner(n_gsl_in, n_channels)
 
-        # 5. FFN
-        self.ffn = FeatureFusionNetwork(n_gsl_in, FFN_FILTERS)
+        # 5. FFN — only the first block pools (leaves a length-T//9 sequence
+        #    for the Autoformer GTL to perform FFT autocorrelation over).
+        n_ffn_pool_blocks = 1
+        self.ffn = FeatureFusionNetwork(n_gsl_in, FFN_FILTERS,
+                                        n_pool_blocks=n_ffn_pool_blocks)
 
-        # 6. GTL
-        self.gtl = GlobalTemporalLearner(FFN_FILTERS[-1], GTL_HEADS, GTL_DROPOUT)
+        # 6. GTL (Autoformer encoder) — smaller decomp kernel suits the
+        #    shorter sequence (T//9 ≈ 11 instead of the long-horizon T~96+).
+        self.gtl = AutoformerGTL(FFN_FILTERS[-1], GTL_HEADS, GTL_DROPOUT,
+                                 decomp_kernel=7)
 
         # 7. Output
-        # T progression: GSL pool-3 + 3 FFN pool-3 = 4 divisions by POOL_WIDTH
+        # T progression: 1 GSL pool + n_ffn_pool_blocks FFN pools
         T_final = n_time
-        for _ in range(1 + len(FFN_FILTERS)):   # 1 GSL + len(FFN) FFN pools
+        for _ in range(1 + n_ffn_pool_blocks):
             T_final = T_final // POOL_WIDTH
         # Output layer: cat(GTL_in, GTL_out) doubles temporal dim
         self.output = Conv2dWithConstraint(
