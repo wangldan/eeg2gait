@@ -1,19 +1,30 @@
-# Byte-compiled / optimized / DLL files
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
+*.pyo
+*.pyd
+.Python
 
-# Mac OS folder attributes
-.DS_Store
-
-# Virtual environments
+# Virtual environment
 venv/
 env/
-ENV/
 .env
 
-# Datasets
+# Outputs / checkpoints
+outputs/
+*.pt
+*.pth
+*.ckpt
+
+# Data
 RepositoryData/
 
-# Ignore Jupyter Notebook checkpoints
+# Jupyter
 .ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
