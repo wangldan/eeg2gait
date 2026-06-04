@@ -13,10 +13,10 @@ import torch
 import numpy as np
 from typing import Dict, Tuple
 
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent))
-from config import JOINT_NAMES, N_JOINTS
+try:
+    from .config import JOINT_NAMES, N_JOINTS
+except ImportError:
+    from config import JOINT_NAMES, N_JOINTS
 
 
 def pearson_r(y_pred: np.ndarray, y_true: np.ndarray) -> np.ndarray:
@@ -108,8 +108,8 @@ def evaluate_loader(model, loader, device: str) -> Dict[str, float]:
     with torch.no_grad():
         for X, y in loader:
             X = X.to(device)
-            ŷ = model(X)
-            preds.append(ŷ.cpu().numpy())
+            y_hat = model(X)
+            preds.append(y_hat.cpu().numpy())
             targets.append(y.numpy())
 
     y_pred = np.concatenate(preds,   axis=0)  # [N, J]

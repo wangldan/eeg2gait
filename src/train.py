@@ -24,6 +24,14 @@ from pathlib import Path
 import torch
 import numpy as np
 
+# ── Kaggle/PyTorch compatibility fix ────────────────────────────────────────
+# Some Kaggle PyTorch builds fail when torch._dynamo lazily imports torch._utils.
+# Force-loading torch._utils now prevents that crash.
+try:
+    import torch._utils   # noqa: F401  – must happen before Adam is used
+except Exception:
+    pass
+
 # ── Path setup ──────────────────────────────────────────────────────────────
 SRC_DIR = Path(__file__).parent
 sys.path.insert(0, str(SRC_DIR))
@@ -118,11 +126,13 @@ def train(subjects=None, sessions=None, device_str=None,
         f"Val batches: {len(val_dl)} | "
         f"Test batches: {len(test_dl)}", log_file)
 
-    # ── Adjacency matrix ─────────────────────────────────────────────────
+    # ── Adjacency matrix (GCM initialization, paper eq.1) ────────────
     log("Building adjacency matrix …", log_file)
     positions = _build_standard_positions()           # [59, 3]
-    A_np      = build_adjacency_matrix(positions)     # [59, 59]
-    A_init    = torch.from_numpy(A_np)
+    A_np      = build_adjacency_matrix(positions)     # [59, 59], no self-loops
+    A_tensor  = torch.from_numpy(A_np)
+    # eq.1: Ã_prior = ReLU(A_prior + A_prior^T) + I
+    A_init = torch.relu(A_tensor + A_tensor.T) + torch.eye(A_tensor.size(0))
 
     # ── Model ────────────────────────────────────────────────────────────
     log("Building model …", log_file)
@@ -132,7 +142,16 @@ def train(subjects=None, sessions=None, device_str=None,
     log(f"Trainable parameters: {n_params:,}", log_file)
 
     # ── Optimiser & loss ─────────────────────────────────────────────────
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    # Use SGD-compatible init path to dodge torch._dynamo import bug on some
+    # Kaggle environments; falls back to plain Adam if the bug is already fixed.
+    try:
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    except AttributeError:
+        # _dynamo import failed; rebuild optimizer manually via Optimizer base
+        import importlib
+        _utils = importlib.import_module("torch._utils")
+        torch._utils = _utils                   # patch into torch namespace
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = HTSRLoss()
 
     # ── Training state ───────────────────────────────────────────────────

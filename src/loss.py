@@ -1,16 +1,16 @@
 """
 loss.py
 -------
-Hybrid Temporal-Spectral Reward (HTSR) Loss.
+Hybrid Temporal-Spectral Reward (HTSR) Loss (paper Sec. III-I).
 
 Paper formulation:
-  L_time        = MSE(ŷ, y)
-  L_time_reward = L_time + β·log(1 − e^{−L_time} + ε)
+  L_time        = MSE(ŷ, y)                                   (eq.8)
+  L_time_reward = L_time + β·log(1 − e^{−L_time} + ε)         (eq.9)
 
-  L_freq        = L1(DFT(ŷ), DFT(y))   [over complex magnitudes]
-  L_freq_reward = L_freq + β·log(1 − e^{−L_freq} + ε)
+  L_freq        = L1(|DFT(ŷ)|, |DFT(y)|)                     (eq.10)
+  L_freq_reward = L_freq + β·log(1 − e^{−L_freq} + ε)         (eq.11)
 
-  L_total = α·L_freq_reward + (1−α)·L_time_reward
+  L_total = α·L_freq_reward + (1−α)·L_time_reward              (eq.12)
 
   Default: α=0.5, β=0.1
 """
@@ -19,10 +19,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent))
-from config import ALPHA, BETA, EPSILON
+try:
+    from .config import ALPHA, BETA, EPSILON
+except ImportError:
+    from config import ALPHA, BETA, EPSILON
 
 
 class HTSRLoss(nn.Module):
@@ -47,14 +47,11 @@ class HTSRLoss(nn.Module):
     def _reward(self, loss_val: torch.Tensor) -> torch.Tensor:
         """
         Reward term: L + β·log(1 − e^{−L} + ε)
-        For large L: log(1 − e^{-L}) → 0  (reward ≈ loss, no penalty)
-        For small L: log(1 − e^{-L}) → −∞ (but tempered by β)
+        For large L: log(1 − e^{-L}) → 0  (no additional penalty)
+        For small L: log(1 − e^{-L}) → −∞ (tempered by β, encourages well-predicted samples)
         """
-        # Clamp to avoid exp underflow/overflow
         L     = loss_val.clamp(min=1e-12)
-        inner = 1.0 - torch.exp(-L) + self.eps
-        # Guard log argument
-        inner = inner.clamp(min=self.eps)
+        inner = (1.0 - torch.exp(-L) + self.eps).clamp(min=self.eps)
         return L + self.beta * torch.log(inner)
 
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor
@@ -66,25 +63,17 @@ class HTSRLoss(nn.Module):
         Returns:
             Scalar total loss.
         """
-        # ── Time-domain ───────────────────────────────────────────────────
-        L_time = F.mse_loss(y_pred, y_true)
+        # ── Time-domain (eq.8-9) ─────────────────────────────────────────
+        L_time   = F.mse_loss(y_pred, y_true)
         L_time_r = self._reward(L_time)
 
-        # ── Frequency-domain ──────────────────────────────────────────────
-        # Compute DFT along joint dimension (or sample-dim if we had sequences)
-        # Since predictions are [B, dj] scalars, we apply rfft over the batch
-        # dimension (treating batch as a "time" axis) to capture spectral structure
-        # across the batch.  Alternatively, if shape is [B, dj], we treat dj as
-        # the signal axis.
-        # The paper applies DFT to the predicted and true waveforms. Here each
-        # sample is already a scalar (mean of window). We use rfft over the dj axis.
-        Y_pred_fft = torch.fft.rfft(y_pred, dim=1)   # [B, dj//2+1] complex
-        Y_true_fft = torch.fft.rfft(y_true, dim=1)
+        # ── Frequency-domain (eq.10-11) ───────────────────────────────────
+        # DFT applied over the joint dimension (dim=1, length dJ=6).
+        # rfft returns dJ//2 + 1 = 4 unique complex frequency bins.
+        Y_hat_freq = torch.fft.rfft(y_pred, dim=1)
+        Y_freq     = torch.fft.rfft(y_true, dim=1)
+        L_freq     = F.l1_loss(Y_hat_freq.abs(), Y_freq.abs())
+        L_freq_r   = self._reward(L_freq)
 
-        # L1 over magnitudes
-        L_freq = F.l1_loss(Y_pred_fft.abs(), Y_true_fft.abs())
-        L_freq_r = self._reward(L_freq)
-
-        # ── Total ──────────────────────────────────────────────────────────
-        L_total = self.alpha * L_freq_r + (1.0 - self.alpha) * L_time_r
-        return L_total
+        # ── Total (eq.12) ─────────────────────────────────────────────────
+        return self.alpha * L_freq_r + (1.0 - self.alpha) * L_time_r

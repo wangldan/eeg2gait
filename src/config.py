@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 
 # ── Paths ────────────────────────────────────────────────────────────────────
-ROOT_DIR   = Path("/Users/jigmetwangldan/LABS/EEG2GAIT")
+ROOT_DIR   = Path(__file__).resolve().parent.parent
 DATA_DIR   = ROOT_DIR / "RepositoryData"
 OUTPUT_DIR = ROOT_DIR / "outputs"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -61,14 +61,16 @@ STRIDE_SECS  = 0.1          # 100 ms stride (10-fold overlap)
 WINDOW_SAMPS = int(WINDOW_SECS  * TARGET_FS)   # 100 samples
 STRIDE_SAMPS = int(STRIDE_SECS * TARGET_FS)    # 10  samples
 
-# ── Model ────────────────────────────────────────────────────────────────────
-F_FILTERS     = 25          # LTL temporal filters
-LTL_KERNEL    = 10          # kernel size along T axis in LTL conv
-HGP_DEPTHS    = [1, 2, 3]  # GCN depths in Hierarchical GCN Pyramid
-GSL_DROPOUT   = 0.5
-FFN_DROPOUTS  = 0.5
-GTL_HEADS     = 4           # multi-head self-attention heads
-GTL_DIM       = 200         # feature dim fed into GTL (after FFN)
+# ── Model (Paper Architecture: LTL → GCM → HGP → GSL → FFN → GTL → Output) ──
+F_FILTERS       = 25              # LTL temporal filters
+LTL_KERNEL      = 10              # LTL conv kernel width
+HGP_DEPTHS      = [1, 2]          # two hierarchical graph encoders (paper Sec. III-D)
+DROPOUT_P       = 0.5             # dropout probability
+POOL_WIDTH      = 3               # MaxPool temporal stride
+KERNEL_WIDTH    = 10              # FFN conv kernel width
+FFN_FILTERS     = [50, 100, 200]  # FFN filter progression: 3 blocks (paper Sec. III-F)
+GTL_HEADS       = 4               # GTL multi-head self-attention heads
+GTL_DROPOUT     = 0.1             # GTL attention dropout
 
 # ── Training ─────────────────────────────────────────────────────────────────
 BATCH_SIZE     = 100
@@ -84,4 +86,4 @@ EPSILON = 1e-8   # numerical stability
 # ── Misc ─────────────────────────────────────────────────────────────────────
 SEED        = 42
 NUM_WORKERS = 0   # set >0 if you have plenty of RAM
-DEVICE      = "cpu"   # change to "cuda" / "mps" if available
+DEVICE      = "auto"  # auto-selects cuda / mps / cpu

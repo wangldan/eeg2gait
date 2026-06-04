@@ -32,21 +32,32 @@ from typing import List, Tuple, Optional
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-from scipy.signal import butter, filtfilt, resample_poly
+from scipy.signal import butter, sosfilt, resample_poly
+from scipy.spatial.distance import cdist
 from math import gcd
 
-import sys
-sys.path.insert(0, str(Path(__file__).parent))
-from config import (
-    DATA_DIR, SUBJECTS, SESSIONS,
-    RAW_FS, TARGET_FS,
-    BANDPASS_LO, BANDPASS_HI,
-    N_CHANNELS_RAW, EOG_CHAN_INDICES, N_CHANNELS,
-    N_JOINTS,
-    TRAIN_MIN, VAL_MIN, TEST_MIN,
-    WINDOW_SAMPS, STRIDE_SAMPS,
-    RADIUS_MM,
-)
+try:
+    from .config import (
+        DATA_DIR, SUBJECTS, SESSIONS,
+        RAW_FS, TARGET_FS,
+        BANDPASS_LO, BANDPASS_HI,
+        N_CHANNELS_RAW, EOG_CHAN_INDICES, N_CHANNELS,
+        N_JOINTS,
+        TRAIN_MIN, VAL_MIN, TEST_MIN,
+        WINDOW_SAMPS, STRIDE_SAMPS,
+        RADIUS_MM,
+    )
+except ImportError:
+    from config import (
+        DATA_DIR, SUBJECTS, SESSIONS,
+        RAW_FS, TARGET_FS,
+        BANDPASS_LO, BANDPASS_HI,
+        N_CHANNELS_RAW, EOG_CHAN_INDICES, N_CHANNELS,
+        N_JOINTS,
+        TRAIN_MIN, VAL_MIN, TEST_MIN,
+        WINDOW_SAMPS, STRIDE_SAMPS,
+        RADIUS_MM,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -115,16 +126,13 @@ def _common_average_reference(data: np.ndarray) -> np.ndarray:
 
 
 def _bandpass_filter(data: np.ndarray, fs: float) -> np.ndarray:
-    """Zero-phase Butterworth band-pass filter (0.1–48 Hz)."""
+    """Minimum-phase Butterworth band-pass filter (0.1–48 Hz), paper Sec. IV-A."""
     nyq  = fs / 2.0
     lo   = BANDPASS_LO / nyq
     hi   = min(BANDPASS_HI / nyq, 0.999)   # must be < 1
-    b, a = butter(4, [lo, hi], btype="band")
-    # filtfilt expects (samples,) per channel
-    filtered = np.empty_like(data)
-    for ch in range(data.shape[1]):
-        filtered[:, ch] = filtfilt(b, a, data[:, ch])
-    return filtered
+    sos  = butter(4, [lo, hi], btype="band", output="sos")
+    # sosfilt is causal (minimum-phase), numerically stable for high-order filters
+    return sosfilt(sos, data, axis=0).astype(data.dtype)
 
 
 def _resample(data: np.ndarray, fs_in: float, fs_out: float) -> np.ndarray:
@@ -161,11 +169,12 @@ def _preprocess_session(eeg_raw: np.ndarray, joints_raw: np.ndarray,
     # 1. Drop artifact channels
     eeg = _drop_eog_channels(eeg_raw)       # [N, 59]
 
-    # 2. Common-Average Reference
-    eeg = _common_average_reference(eeg)
-
-    # 3. Band-pass filter
+    # 2. Band-pass filter (minimum-phase, paper Sec. IV-A: "First, a minimum-phase
+    #    band-pass filter…was applied, followed by re-referencing to the common average")
     eeg = _bandpass_filter(eeg, fs)
+
+    # 3. Common-Average Reference
+    eeg = _common_average_reference(eeg)
 
     # 4. Resample EEG
     eeg = _resample(eeg, fs, TARGET_FS)     # [M, 59]
@@ -291,15 +300,12 @@ def build_adjacency_matrix(positions: Optional[np.ndarray] = None,
     """
     if positions is None:
         positions = _build_standard_positions()   # [59, 3]
-    C = positions.shape[0]
-    A = np.zeros((C, C), dtype=np.float32)
-    for i in range(C):
-        for j in range(C):
-            dist = np.linalg.norm(positions[i] - positions[j])
-            if dist <= radius:
-                A[i, j] = 1.0
-    # Self-loops
-    np.fill_diagonal(A, 1.0)
+    # Vectorised distance computation
+    dist_matrix = cdist(positions, positions, metric='euclidean')
+    A = (dist_matrix <= radius).astype(np.float32)
+    # Self-loops are NOT added here; they are added via +I in eq.1 (train.py),
+    # which also symmetrizes: Ã_prior = ReLU(A + A^T) + I
+    np.fill_diagonal(A, 0.0)
     return A
 
 
@@ -421,7 +427,10 @@ class MoBIDataset(Dataset):
         return len(self.X)
 
     def __getitem__(self, idx: int):
-        return torch.from_numpy(self.X[idx]), torch.from_numpy(self.y[idx])
+        # Official model expects [1, C, T] input (4D with 1 channel dim)
+        x = torch.from_numpy(self.X[idx]).unsqueeze(0)  # [C, T] → [1, C, T]
+        y = torch.from_numpy(self.y[idx])
+        return x, y
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -445,11 +454,12 @@ def get_dataloaders(subjects: List[str] = SUBJECTS,
     print("Building Test  dataset …")
     test_ds  = MoBIDataset(subjects, sessions, "test",  data_dir, verbose)
 
+    _pin = torch.cuda.is_available()
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                          num_workers=num_workers, pin_memory=False, drop_last=True)
+                          num_workers=num_workers, pin_memory=_pin, drop_last=True)
     val_dl   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
-                          num_workers=num_workers, pin_memory=False)
+                          num_workers=num_workers, pin_memory=_pin)
     test_dl  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False,
-                          num_workers=num_workers, pin_memory=False)
+                          num_workers=num_workers, pin_memory=_pin)
 
     return train_dl, val_dl, test_dl
