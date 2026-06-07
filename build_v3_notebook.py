@@ -80,9 +80,8 @@ GTL_DROPOUT     = 0.1
 # ── Training ─────────────────────────────────────────────────────────────────
 BATCH_SIZE     = 100
 LR             = 1e-3
-# v3: train longer + larger patience (master hit best epoch 45/50)
-MAX_EPOCHS     = 80
-PATIENCE       = 50
+MAX_EPOCHS     = 50
+PATIENCE       = 20
 
 # v3 additions
 WEIGHT_DECAY    = 1e-4
@@ -183,8 +182,8 @@ cells.append(make_code_cell(
     "model, results = train(\n"
     "    device_str  = device,\n"
     "    batch_size  = 100,\n"
-    "    max_epochs  = 80,\n"
-    "    patience    = 50,\n"
+    "    max_epochs  = 50,\n"
+    "    patience    = 20,\n"
     f"    output_dir  = '{KGGL_WORK}/outputs',\n"
     ")"
 ))

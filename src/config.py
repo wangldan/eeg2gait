@@ -80,10 +80,8 @@ GTL_DROPOUT     = 0.1             # GTL attention dropout
 # ── Training ─────────────────────────────────────────────────────────────────
 BATCH_SIZE     = 100
 LR             = 1e-3
-# v3 change: master hit best epoch at 45/50 — training was still climbing.
-# Train longer and let early stopping decide.
-MAX_EPOCHS     = 80
-PATIENCE       = 50
+MAX_EPOCHS     = 50
+PATIENCE       = 20
 
 # v3 additions: regularisation + LR schedule
 WEIGHT_DECAY    = 1e-4            # AdamW weight decay (mild L2)
