@@ -41,6 +41,7 @@ from config import (
     BATCH_SIZE, LR, MAX_EPOCHS, PATIENCE,
     SEED, NUM_WORKERS, DEVICE,
     N_CHANNELS, WINDOW_SAMPS, N_JOINTS,
+    WEIGHT_DECAY, LR_WARMUP_EPOCHS,
 )
 from dataset import get_dataloaders, build_adjacency_matrix, _build_standard_positions
 from model  import build_model
@@ -142,16 +143,32 @@ def train(subjects=None, sessions=None, device_str=None,
     log(f"Trainable parameters: {n_params:,}", log_file)
 
     # ── Optimiser & loss ─────────────────────────────────────────────────
-    # Use SGD-compatible init path to dodge torch._dynamo import bug on some
-    # Kaggle environments; falls back to plain Adam if the bug is already fixed.
+    # v3: AdamW (decoupled weight decay) + linear-warmup + cosine LR schedule.
+    # AdamW's weight decay regularises better than plain Adam's L2, and the
+    # warmup-then-cosine schedule is the standard recipe for stable convergence.
     try:
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr,
+                                      weight_decay=WEIGHT_DECAY)
     except AttributeError:
         # _dynamo import failed; rebuild optimizer manually via Optimizer base
         import importlib
         _utils = importlib.import_module("torch._utils")
         torch._utils = _utils                   # patch into torch namespace
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr,
+                                      weight_decay=WEIGHT_DECAY)
+
+    # Linear warmup for the first LR_WARMUP_EPOCHS, then cosine decay to ~LR/100.
+    def _lr_factor(epoch_idx):
+        if epoch_idx < LR_WARMUP_EPOCHS:
+            return (epoch_idx + 1) / LR_WARMUP_EPOCHS
+        progress = (epoch_idx - LR_WARMUP_EPOCHS) / max(
+            1, max_epochs - LR_WARMUP_EPOCHS
+        )
+        # cosine from 1.0 → 0.01
+        import math
+        return 0.01 + 0.99 * 0.5 * (1 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_factor)
     criterion = HTSRLoss()
 
     # ── Training state ───────────────────────────────────────────────────
@@ -181,6 +198,9 @@ def train(subjects=None, sessions=None, device_str=None,
 
         avg_train_loss = total_loss / max(len(train_dl), 1)
 
+        # v3: step the LR schedule once per epoch.
+        scheduler.step()
+
         # ── Validate ─────────────────────────────────────────────────────
         val_metrics = evaluate_loader(model, val_dl, device_str)
         val_r       = val_metrics["r_mean"]
@@ -188,7 +208,9 @@ def train(subjects=None, sessions=None, device_str=None,
         val_mae     = val_metrics["mae_mean"]
 
         elapsed = time.time() - t0
+        current_lr = optimizer.param_groups[0]["lr"]
         msg = (f"Epoch {epoch:03d}/{max_epochs} | "
+               f"LR: {current_lr:.5f} | "
                f"Loss: {avg_train_loss:.4f} | "
                f"Val r: {val_r:.4f} | "
                f"Val R²: {val_r2:.4f} | "

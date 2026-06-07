@@ -56,15 +56,20 @@ VAL_MIN     = 1.5
 TEST_MIN    = 5.0
 
 # ── Window / stride ──────────────────────────────────────────────────────────
-WINDOW_SECS  = 1.0          # 1-second window
-STRIDE_SECS  = 0.1          # 100 ms stride (10-fold overlap)
-WINDOW_SAMPS = int(WINDOW_SECS  * TARGET_FS)   # 100 samples
+# v3 change: 1 s → 2 s window. Each sample now covers ~2 gait cycles instead of 1,
+# giving the GTL/FFN convs cross-cycle context to compare. T at GTL goes 1 → 2.
+WINDOW_SECS  = 2.0
+STRIDE_SECS  = 0.1
+WINDOW_SAMPS = int(WINDOW_SECS  * TARGET_FS)   # 200 samples
 STRIDE_SAMPS = int(STRIDE_SECS * TARGET_FS)    # 10  samples
 
 # ── Model (Paper Architecture: LTL → GCM → HGP → GSL → FFN → GTL → Output) ──
 F_FILTERS       = 25              # LTL temporal filters
 LTL_KERNEL      = 10              # LTL conv kernel width
-HGP_DEPTHS      = [1, 2]          # two hierarchical graph encoders (paper Sec. III-D)
+# v3 change: K=2 → K=3 graph branches (depths 1, 2, 3). More diverse spatial
+# receptive fields — shallower branch captures local clusters, deeper one captures
+# global brain-network patterns. Matches the Kaggle-notebook variant.
+HGP_DEPTHS      = [1, 2, 3]
 DROPOUT_P       = 0.5             # dropout probability
 POOL_WIDTH      = 3               # MaxPool temporal stride
 KERNEL_WIDTH    = 10              # FFN conv kernel width
@@ -75,13 +80,31 @@ GTL_DROPOUT     = 0.1             # GTL attention dropout
 # ── Training ─────────────────────────────────────────────────────────────────
 BATCH_SIZE     = 100
 LR             = 1e-3
-MAX_EPOCHS     = 50
-PATIENCE       = 30         # early-stop patience (on val Pearson r)
+# v3 change: master hit best epoch at 45/50 — training was still climbing.
+# Train longer and let early stopping decide.
+MAX_EPOCHS     = 80
+PATIENCE       = 50
+
+# v3 additions: regularisation + LR schedule
+WEIGHT_DECAY    = 1e-4            # AdamW weight decay (mild L2)
+LR_WARMUP_EPOCHS = 5              # linear warmup before cosine decay
 
 # ── Loss ─────────────────────────────────────────────────────────────────────
 ALPHA   = 0.5    # freq / time weighting
 BETA    = 0.1    # reward strength
 EPSILON = 1e-8   # numerical stability
+
+# v3 change: per-joint loss weighting. Knees (GKR, GKL) had MAE ~2× the others on
+# the master baseline — they're the bottleneck. Up-weighting their MSE term gives
+# the optimiser a stronger signal where it matters most.
+#                       GHR  GKR  GAR  GHL  GKL  GAL
+JOINT_LOSS_WEIGHTS = [1.0, 1.5, 1.0, 1.0, 1.5, 1.0]
+
+# ── Augmentation (train split only) ──────────────────────────────────────────
+# v3 additions: standard EEG augmentations to reduce overfitting on 8 subjects.
+AUG_CHANNEL_DROPOUT = 0.10        # P(per-channel zeroing) per sample
+AUG_NOISE_STD       = 0.02        # additive Gaussian noise (relative to signal std)
+AUG_TIME_JITTER     = 5           # samples (±5 = ±50 ms at 100 Hz)
 
 # ── Misc ─────────────────────────────────────────────────────────────────────
 SEED        = 42

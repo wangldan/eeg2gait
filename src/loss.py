@@ -20,9 +20,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    from .config import ALPHA, BETA, EPSILON
+    from .config import ALPHA, BETA, EPSILON, JOINT_LOSS_WEIGHTS
 except ImportError:
-    from config import ALPHA, BETA, EPSILON
+    from config import ALPHA, BETA, EPSILON, JOINT_LOSS_WEIGHTS
 
 
 class HTSRLoss(nn.Module):
@@ -33,16 +33,27 @@ class HTSRLoss(nn.Module):
         alpha (float): Weight for frequency-domain loss  (default 0.5)
         beta  (float): Reward strength                   (default 0.1)
         eps   (float): Numerical stability term          (default 1e-8)
+        joint_weights (list[float] | None): per-joint weights applied to the
+            time-domain MSE. None → uniform (paper default). v3 default uses
+            JOINT_LOSS_WEIGHTS from config to up-weight the knees, which had
+            the worst per-joint MAE in the master baseline.
     """
 
     def __init__(self,
                  alpha: float = ALPHA,
                  beta:  float = BETA,
-                 eps:   float = EPSILON):
+                 eps:   float = EPSILON,
+                 joint_weights = JOINT_LOSS_WEIGHTS):
         super().__init__()
         self.alpha = alpha
         self.beta  = beta
         self.eps   = eps
+        if joint_weights is None:
+            self.register_buffer("joint_w", None)
+        else:
+            w = torch.tensor(joint_weights, dtype=torch.float32)
+            w = w * (len(w) / w.sum())   # normalise to mean = 1 (same scale as uniform)
+            self.register_buffer("joint_w", w)
 
     def _reward(self, loss_val: torch.Tensor) -> torch.Tensor:
         """
@@ -64,7 +75,13 @@ class HTSRLoss(nn.Module):
             Scalar total loss.
         """
         # ── Time-domain (eq.8-9) ─────────────────────────────────────────
-        L_time   = F.mse_loss(y_pred, y_true)
+        # v3 change: per-joint-weighted MSE (knees up-weighted). Normalised
+        # weights mean overall scale matches the uniform paper version.
+        if self.joint_w is not None:
+            sq_err = (y_pred - y_true) ** 2                    # [B, dj]
+            L_time = (sq_err * self.joint_w).mean()
+        else:
+            L_time = F.mse_loss(y_pred, y_true)
         L_time_r = self._reward(L_time)
 
         # ── Frequency-domain (eq.10-11) ───────────────────────────────────

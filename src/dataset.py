@@ -46,6 +46,7 @@ try:
         TRAIN_MIN, VAL_MIN, TEST_MIN,
         WINDOW_SAMPS, STRIDE_SAMPS,
         RADIUS_MM,
+        AUG_CHANNEL_DROPOUT, AUG_NOISE_STD, AUG_TIME_JITTER,
     )
 except ImportError:
     from config import (
@@ -57,7 +58,50 @@ except ImportError:
         TRAIN_MIN, VAL_MIN, TEST_MIN,
         WINDOW_SAMPS, STRIDE_SAMPS,
         RADIUS_MM,
+        AUG_CHANNEL_DROPOUT, AUG_NOISE_STD, AUG_TIME_JITTER,
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# v3 addition: EEG augmentation for the train split only.
+# Applied at __getitem__ time so each epoch sees fresh perturbations.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _augment_eeg(x: np.ndarray,
+                 channel_dropout: float = AUG_CHANNEL_DROPOUT,
+                 noise_std:       float = AUG_NOISE_STD,
+                 time_jitter:     int   = AUG_TIME_JITTER) -> np.ndarray:
+    """
+    Apply lightweight EEG augmentations.
+    Args:
+        x: [C, T] preprocessed window (float32)
+    Returns:
+        Augmented [C, T] window.
+    """
+    x = x.copy()
+    C, T = x.shape
+
+    # 1. Channel dropout — zero a small random subset of channels.
+    #    Encourages the GCN to spread information across the spatial graph.
+    if channel_dropout > 0:
+        mask = np.random.rand(C) < channel_dropout
+        if mask.any():
+            x[mask] = 0.0
+
+    # 2. Additive Gaussian noise — relative to per-window signal std.
+    #    Standard regulariser for sensor data.
+    if noise_std > 0:
+        sigma = noise_std * (x.std() + 1e-8)
+        x = x + np.random.randn(C, T).astype(np.float32) * sigma
+
+    # 3. Temporal jitter — circular shift by a small random amount.
+    #    Trains the model to be robust to phase misalignment.
+    if time_jitter > 0:
+        shift = np.random.randint(-time_jitter, time_jitter + 1)
+        if shift != 0:
+            x = np.roll(x, shift, axis=1)
+
+    return x.astype(np.float32)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -383,7 +427,11 @@ class MoBISessionDataset(Dataset):
         return len(self.X)
 
     def __getitem__(self, idx: int):
-        return torch.from_numpy(self.X[idx]), torch.from_numpy(self.y[idx])
+        x = self.X[idx]
+        # v3: augment train samples only — val/test stay deterministic.
+        if self.split == "train":
+            x = _augment_eeg(x)
+        return torch.from_numpy(x), torch.from_numpy(self.y[idx])
 
 
 class MoBIDataset(Dataset):
