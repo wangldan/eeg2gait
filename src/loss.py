@@ -79,7 +79,14 @@ class HTSRLoss(nn.Module):
         # weights mean overall scale matches the uniform paper version.
         if self.joint_w is not None:
             sq_err = (y_pred - y_true) ** 2                    # [B, dj]
-            L_time = (sq_err * self.joint_w).mean()
+            # Defensive device match: HTSRLoss is sometimes instantiated without
+            # ever being `.to(device)`'d (the original training script does that),
+            # so move the weight buffer to the input device lazily.
+            w = self.joint_w
+            if w.device != y_pred.device:
+                w = w.to(y_pred.device)
+                self.joint_w = w
+            L_time = (sq_err * w).mean()
         else:
             L_time = F.mse_loss(y_pred, y_true)
         L_time_r = self._reward(L_time)

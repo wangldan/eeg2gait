@@ -169,7 +169,8 @@ def train(subjects=None, sessions=None, device_str=None,
         return 0.01 + 0.99 * 0.5 * (1 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_factor)
-    criterion = HTSRLoss()
+    # v3: HTSRLoss has a registered buffer (joint_w) → must be moved to device.
+    criterion = HTSRLoss().to(device)
 
     # ── Training state ───────────────────────────────────────────────────
     best_val_r    = -1.0
