@@ -445,6 +445,7 @@ class MoBIDataset(Dataset):
                  split: str = "train",
                  data_dir: Path = DATA_DIR,
                  verbose: bool = True):
+        self.split = split   # v3: remember split so __getitem__ can gate augmentation
         self.datasets: List[MoBISessionDataset] = []
         for subj in subjects:
             for sess in sessions:
@@ -476,7 +477,11 @@ class MoBIDataset(Dataset):
 
     def __getitem__(self, idx: int):
         # Official model expects [1, C, T] input (4D with 1 channel dim)
-        x = torch.from_numpy(self.X[idx]).unsqueeze(0)  # [C, T] → [1, C, T]
+        x_np = self.X[idx]
+        # v3: augment train samples; val/test stay deterministic.
+        if self.split == "train":
+            x_np = _augment_eeg(x_np)
+        x = torch.from_numpy(x_np).unsqueeze(0)         # [C, T] → [1, C, T]
         y = torch.from_numpy(self.y[idx])
         return x, y
 
