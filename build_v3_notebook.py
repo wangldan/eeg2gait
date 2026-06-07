@@ -140,8 +140,9 @@ cells.append(make_md_cell("# EEG2GAIT v3 — Improved Hierarchical GCN for EEG-B
                           "4. Train-only EEG augmentation (channel dropout / Gaussian noise / temporal jitter)\n"
                           "5. AdamW + linear-warmup + cosine LR schedule, 80 epochs / patience 50"))
 
-cells.append(make_code_cell("# Install dependencies (Kaggle base usually has these)\n"
-                            "!pip install -q torch numpy scipy"))
+cells.append(make_code_cell("# Verify deps (all preinstalled on Kaggle — no pip install needed)\n"
+                            "import torch, numpy, scipy\n"
+                            "print(f'torch {torch.__version__} | numpy {numpy.__version__} | scipy {scipy.__version__}')"))
 
 cells.append(make_code_cell("import os\nfrom pathlib import Path\n\n"
                             f"WORK = Path('{KGGL_WORK}')\nWORK.mkdir(parents=True, exist_ok=True)\n"
