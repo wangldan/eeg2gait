@@ -78,7 +78,8 @@ GTL_HEADS       = 4               # GTL multi-head self-attention heads
 GTL_DROPOUT     = 0.1             # GTL attention dropout
 
 # ── Training ─────────────────────────────────────────────────────────────────
-BATCH_SIZE     = 100
+# v3-speed: batch 100 → 256 (T4 has plenty of memory; ~2× faster per epoch)
+BATCH_SIZE     = 256
 LR             = 1e-3
 MAX_EPOCHS     = 50
 PATIENCE       = 20
@@ -106,5 +107,6 @@ AUG_TIME_JITTER     = 5           # samples (±5 = ±50 ms at 100 Hz)
 
 # ── Misc ─────────────────────────────────────────────────────────────────────
 SEED        = 42
-NUM_WORKERS = 0   # set >0 if you have plenty of RAM
+# v3-speed: 2 worker processes for overlapped data prep + GPU compute.
+NUM_WORKERS = 2
 DEVICE      = "auto"  # auto-selects cuda / mps / cpu

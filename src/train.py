@@ -172,6 +172,17 @@ def train(subjects=None, sessions=None, device_str=None,
     # v3: HTSRLoss has a registered buffer (joint_w) → must be moved to device.
     criterion = HTSRLoss().to(device)
 
+    # v3-speed: mixed-precision training. Tensor cores on T4/V100/A100 cut
+    # forward+backward time ~2× with no accuracy cost. Disabled on CPU/MPS.
+    use_amp = (device.type == "cuda")
+    # Newer torch.amp API (PyTorch ≥ 2.0); fall back to the legacy namespace.
+    try:
+        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    except (AttributeError, TypeError):
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    if use_amp:
+        log("Mixed-precision (AMP) ENABLED — fp16 forward/backward on tensor cores", log_file)
+
     # ── Training state ───────────────────────────────────────────────────
     best_val_r    = -1.0
     best_epoch    = 0
@@ -187,14 +198,26 @@ def train(subjects=None, sessions=None, device_str=None,
         model.train()
         total_loss = 0.0
         for X, y in train_dl:
-            X, y = X.to(device), y.to(device)
-            optimizer.zero_grad()
-            y_hat = model(X)
-            loss  = criterion(y_hat, y)
-            loss.backward()
-            # Gradient clipping for stability
+            X = X.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+
+            # v3-speed: AMP autocast for the forward + loss.
+            try:
+                amp_ctx = torch.amp.autocast("cuda", enabled=use_amp)
+            except (AttributeError, TypeError):
+                amp_ctx = torch.cuda.amp.autocast(enabled=use_amp)
+            with amp_ctx:
+                y_hat = model(X)
+                loss  = criterion(y_hat, y)
+
+            # Scale loss so fp16 gradients don't underflow, then standard
+            # unscale → clip → step → update cycle.
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             total_loss += loss.item()
 
         avg_train_loss = total_loss / max(len(train_dl), 1)
