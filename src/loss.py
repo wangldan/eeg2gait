@@ -94,8 +94,10 @@ class HTSRLoss(nn.Module):
         # ── Frequency-domain (eq.10-11) ───────────────────────────────────
         # DFT applied over the joint dimension (dim=1, length dJ=6).
         # rfft returns dJ//2 + 1 = 4 unique complex frequency bins.
-        Y_hat_freq = torch.fft.rfft(y_pred, dim=1)
-        Y_freq     = torch.fft.rfft(y_true, dim=1)
+        # v3-speed fix: cuFFT requires power-of-2 sizes in fp16, and dJ=6 isn't
+        # one. Cast to fp32 for the FFT — cost is negligible (6 elements).
+        Y_hat_freq = torch.fft.rfft(y_pred.float(), dim=1)
+        Y_freq     = torch.fft.rfft(y_true.float(), dim=1)
         L_freq     = F.l1_loss(Y_hat_freq.abs(), Y_freq.abs())
         L_freq_r   = self._reward(L_freq)
 
